@@ -8,22 +8,24 @@ import {
   Box, CssBaseline, AppBar, Toolbar, Typography, TextField,
   IconButton, Divider, Drawer, InputAdornment, Tooltip,
   Chip, CircularProgress, Menu, MenuItem, ListItemIcon, ListItemText,
-  List, ListItemButton, Avatar
+  List, ListItemButton, Avatar, Collapse
 } from "@mui/material";
 import {
   Search, FolderOpen, OpenInNew,
   DarkMode, LightMode, DriveFileMove,
   AttachFile, ArrowBack, Settings,
-  Email, ViewStream, SortRounded
+  Email, ViewStream, SortRounded,
+  ChevronRight, ExpandMore,
+  Folder, Refresh
 } from "@mui/icons-material";
 import { DataGrid, type GridColDef } from "@mui/x-data-grid";
 
 // Theme
 import { getTheme } from "./theme";
 
-const DRAWER_WIDTH = 240;
+const DRAWER_WIDTH = 280; // Slightly wider for explorer
 const OUTLOOK_LIST_WIDTH = 380;
-const APP_VERSION = "v0.9.0";
+const APP_VERSION = "v1.0.0";
 
 const formatFullDate = (isoString: string) => {
   try {
@@ -67,11 +69,88 @@ const formatDate = (dateValue: any) => {
   }
 };
 
+// Recursive File Tree Component
+const FileTreeNode = ({ node, level, onSelect, selectedPath, expandedPaths, toggleExpand }: any) => {
+  const isExpanded = expandedPaths.has(node.path);
+  const isSelected = selectedPath === node.path;
+
+  const handleToggle = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    toggleExpand(node.path);
+  };
+
+  const handleSelect = () => {
+    onSelect(node.path);
+  };
+
+  return (
+    <Box sx={{ userSelect: 'none' }}>
+      <Box
+        onClick={handleSelect}
+        sx={{
+          display: 'flex',
+          alignItems: 'center',
+          py: 0.5,
+          pl: level * 1.5 + 1.5,
+          pr: 1,
+          cursor: 'pointer',
+          borderRadius: 1,
+          bgcolor: isSelected ? 'action.selected' : 'transparent',
+          '&:hover': { bgcolor: 'action.hover' },
+          transition: 'background-color 0.1s',
+          gap: 0.5
+        }}
+      >
+        <Box onClick={handleToggle} sx={{ display: 'flex', alignItems: 'center', color: 'text.disabled', mr: 0.25 }}>
+          {isExpanded ? <ExpandMore sx={{ fontSize: 14 }} /> : <ChevronRight sx={{ fontSize: 14 }} />}
+        </Box>
+
+        <Folder sx={{ fontSize: 16, color: 'primary.main', opacity: 0.8 }} />
+
+        <Typography
+          variant="caption"
+          sx={{
+            fontSize: '0.72rem',
+            fontWeight: isSelected ? 700 : 500,
+            color: isSelected ? 'primary.main' : 'text.primary',
+            whiteSpace: 'nowrap',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            fontFamily: '"Outfit", sans-serif'
+          }}
+        >
+          {node.name}
+        </Typography>
+      </Box>
+
+      {node.children.length > 0 && (
+        <Collapse in={isExpanded} timeout="auto" unmountOnExit>
+          {node.children.map((child: any) => (
+            <FileTreeNode
+              key={child.path}
+              node={child}
+              level={level + 1}
+              onSelect={onSelect}
+              selectedPath={selectedPath}
+              expandedPaths={expandedPaths}
+              toggleExpand={toggleExpand}
+            />
+          ))}
+        </Collapse>
+      )}
+    </Box>
+  );
+};
+
 export default function App() {
   const [emails, setEmails] = useState<any[]>([]);
   const [selectedEmail, setSelectedEmail] = useState<any | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
-  const [folderPath, setFolderPath] = useState<string | null>(null);
+  const [currentFolderPath, setCurrentFolderPath] = useState<string | null>(null);
+  const [selectedTreePath, setSelectedTreePath] = useState<string | null>(null);
+  const [fileTree, setFileTree] = useState<any>(null);
+  const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set());
+
   const [darkMode, setDarkMode] = useState(true);
   const [isSyncing, setIsSyncing] = useState(false);
   const [viewStyle, setViewStyle] = useState<'gmail' | 'outlook'>('outlook');
@@ -82,7 +161,42 @@ export default function App() {
 
   const theme = useMemo(() => getTheme(darkMode ? "dark" : "light"), [darkMode]);
 
-  // Handle Escape key to deselect
+  const toggleExpand = (path: string) => {
+    setExpandedPaths(prev => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  };
+
+  const fetchEmails = useCallback(async (query: string, pathFilter: string | null) => {
+    try {
+      const data = await invoke<any[]>("search_emails", {
+        query,
+        pathFilter: pathFilter || null
+      });
+      setEmails(data);
+    } catch (e) {
+      console.error("Search error:", e);
+    }
+  }, []);
+
+  const fetchTree = useCallback(async (root: string) => {
+    try {
+      const tree = await invoke<any>("get_file_tree", { rootPath: root });
+      setFileTree(tree);
+      // Automatically expand root if new
+      setExpandedPaths(prev => {
+        const next = new Set(prev);
+        next.add(root);
+        return next;
+      });
+    } catch (e) {
+      console.error("Tree error:", e);
+    }
+  }, []);
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -93,22 +207,14 @@ export default function App() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, []);
 
-  const fetchEmails = useCallback(async (query: string) => {
-    try {
-      const data = await invoke<any[]>("search_emails", { query });
-      setEmails(data);
-    } catch (e) {
-      console.error("Search error:", e);
-    }
-  }, []);
-
   useEffect(() => {
     const init = async () => {
       try {
         const saved = await invoke<string | null>("get_registered_path");
         if (saved) {
-          setFolderPath(saved);
-          fetchEmails("");
+          setCurrentFolderPath(saved);
+          fetchEmails("", null);
+          fetchTree(saved);
         }
         const user = await invoke<any>("get_user_info");
         setUserInfo(user);
@@ -117,7 +223,7 @@ export default function App() {
       }
     };
     init();
-  }, [fetchEmails]);
+  }, [fetchEmails, fetchTree]);
 
   const handleRegisterFolder = async () => {
     try {
@@ -125,8 +231,10 @@ export default function App() {
       if (selected && typeof selected === "string") {
         setIsSyncing(true);
         await invoke("index_folder", { folderPath: selected });
-        setFolderPath(selected);
-        fetchEmails(searchQuery);
+        setCurrentFolderPath(selected);
+        setSelectedTreePath(null);
+        fetchEmails(searchQuery, null);
+        fetchTree(selected);
         setIsSyncing(false);
       }
     } catch (e) {
@@ -135,12 +243,30 @@ export default function App() {
     }
   };
 
-  const handleSearch = async (val: string) => {
-    setSearchQuery(val);
-    fetchEmails(val);
+  const handleRefresh = async () => {
+    if (!currentFolderPath) return;
+    try {
+      setIsSyncing(true);
+      await invoke("index_folder", { folderPath: currentFolderPath });
+      fetchEmails(searchQuery, selectedTreePath);
+      fetchTree(currentFolderPath);
+      setIsSyncing(false);
+    } catch (e) {
+      console.error("Refresh error:", e);
+      setIsSyncing(false);
+    }
   };
 
-  // Sort emails based on sortOrder
+  const handleSearch = async (val: string) => {
+    setSearchQuery(val);
+    fetchEmails(val, selectedTreePath);
+  };
+
+  const handleTreeSelect = (path: string) => {
+    setSelectedTreePath(path);
+    fetchEmails(searchQuery, path);
+  };
+
   const sortedEmails = useMemo(() => {
     const sorted = [...emails];
     sorted.sort((a, b) => {
@@ -207,10 +333,6 @@ export default function App() {
       )
     },
   ], []);
-
-  const pathSegments = folderPath
-    ? folderPath.replace(/\\/g, "/").split("/").filter(Boolean)
-    : [];
 
   const renderEmailDetail = (email: any) => (
     <Box
@@ -310,62 +432,74 @@ export default function App() {
           </Box>
 
           <Box sx={{ flexGrow: 1, overflow: "hidden", display: "flex", flexDirection: "column", p: 1.5 }}>
-            <Box sx={{ display: "flex", alignItems: "center", mb: 0.5, px: 0.5 }}>
-              <Typography variant="caption" sx={{ fontWeight: 700, letterSpacing: 1, color: "text.disabled", flexGrow: 1, fontSize: "0.6rem", fontFamily: '"Outfit", sans-serif' }}>
-                ARCHIVE
+            <Box sx={{ display: "flex", alignItems: "center", mb: 1, px: 0.5 }}>
+              <Typography variant="caption" sx={{ fontWeight: 700, letterSpacing: 1, color: "text.disabled", flexGrow: 1, fontSize: "0.65rem", fontFamily: '"Outfit", sans-serif' }}>
+                EXPLORER
               </Typography>
-              <Tooltip title="Change archive location" placement="right" arrow>
-                <IconButton size="small" disabled={isSyncing} onClick={handleRegisterFolder} sx={{ p: 0.4, color: "text.disabled", "&:hover": { color: "primary.main" } }}>
-                  <DriveFileMove sx={{ fontSize: 14 }} />
-                </IconButton>
-              </Tooltip>
+
+              <Box sx={{ display: 'flex', gap: 0.25 }}>
+                <Tooltip title="Refresh Indexing" arrow>
+                  <IconButton
+                    size="small"
+                    disabled={isSyncing || !currentFolderPath}
+                    onClick={handleRefresh}
+                    sx={{ p: 0.4, color: "text.disabled", "&:hover": { color: "primary.main" } }}
+                  >
+                    <Refresh sx={{ fontSize: 14 }} />
+                  </IconButton>
+                </Tooltip>
+                <Tooltip title="Change archive root" arrow>
+                  <IconButton size="small" disabled={isSyncing} onClick={handleRegisterFolder} sx={{ p: 0.4, color: "text.disabled", "&:hover": { color: "primary.main" } }}>
+                    <DriveFileMove sx={{ fontSize: 14 }} />
+                  </IconButton>
+                </Tooltip>
+              </Box>
             </Box>
 
-            {folderPath ? (
-              <Box sx={{ bgcolor: "action.selected", borderRadius: 1.5, p: 1.25, mb: 1 }}>
-                <Box sx={{ display: "flex", alignItems: "center", gap: 0.75, mb: 0.75 }}>
-                  <FolderOpen sx={{ fontSize: 14, color: "primary.main" }} />
-                  <Typography variant="caption" sx={{ fontWeight: 700, color: "text.primary", flexGrow: 1, fontSize: "0.72rem", fontFamily: '"Outfit", sans-serif' }} noWrap>
-                    {pathSegments[pathSegments.length - 1]}
-                  </Typography>
-                  {isSyncing && <CircularProgress size={10} color="primary" />}
+            <Box sx={{ flexGrow: 1, overflowY: 'auto', mb: 1 }}>
+              {isSyncing ? (
+                <Box sx={{ p: 2, display: 'flex', alignItems: 'center', gap: 1.5 }}>
+                  <CircularProgress size={16} />
+                  <Typography variant="caption">Updating index...</Typography>
                 </Box>
-                <Box sx={{ display: "flex", flexDirection: "column", gap: 0.1 }}>
-                  {pathSegments.slice(-3).map((seg, i) => (
-                    <Typography key={i} variant="caption" sx={{ fontSize: "0.6rem", color: "text.disabled" }} noWrap>
-                      {i > 0 ? "› " : "/"}{seg}
-                    </Typography>
-                  ))}
+              ) : fileTree ? (
+                <FileTreeNode
+                  node={fileTree}
+                  level={0}
+                  onSelect={handleTreeSelect}
+                  selectedPath={selectedTreePath}
+                  expandedPaths={expandedPaths}
+                  toggleExpand={toggleExpand}
+                />
+              ) : (
+                <Box onClick={handleRegisterFolder} sx={{ border: "1px dashed", borderColor: "divider", borderRadius: 1.5, p: 2, textAlign: "center", cursor: "pointer", "&:hover": { borderColor: "primary.main", bgcolor: 'action.hover' } }}>
+                  <FolderOpen sx={{ fontSize: 28, color: "text.disabled", mb: 1 }} />
+                  <Typography variant="caption" sx={{ display: "block", color: "text.disabled", fontWeight: 600 }}>Open Archive Folder</Typography>
                 </Box>
-              </Box>
-            ) : (
-              <Box onClick={handleRegisterFolder} sx={{ border: "1px dashed", borderColor: "divider", borderRadius: 1.5, p: 1.5, textAlign: "center", cursor: "pointer", "&:hover": { borderColor: "primary.main" } }}>
-                <FolderOpen sx={{ fontSize: 22, color: "text.disabled", mb: 0.5 }} />
-                <Typography variant="caption" sx={{ display: "block", color: "text.disabled" }}>Open Archive</Typography>
-              </Box>
-            )}
+              )}
+            </Box>
 
             <Divider sx={{ my: 1 }} />
             {emails.length > 0 && (
-              <Typography variant="caption" sx={{ color: "text.disabled", px: 0.5, fontSize: "0.65rem" }}>
-                {emails.length.toLocaleString()} items
+              <Typography variant="caption" sx={{ color: "text.disabled", px: 0.5, fontSize: "0.65rem", display: 'flex', justifyContent: 'space-between' }}>
+                <span>{emails.length.toLocaleString()} items found</span>
+                {selectedTreePath && <Chip label="Filtered" size="small" sx={{ height: 16, fontSize: '0.55rem' }} />}
               </Typography>
             )}
-            
+
             <Box sx={{ flexGrow: 1 }} />
-            
-            {/* User Info and Toggles Section Below the Line */}
+
             <Divider />
-            
+
             <Box sx={{ p: 2 }}>
               {userInfo && (
                 <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 1.5 }}>
-                  <Avatar 
-                    sx={{ 
-                      width: 32, 
-                      height: 32, 
-                      fontSize: '0.85rem', 
-                      fontWeight: 700, 
+                  <Avatar
+                    sx={{
+                      width: 32,
+                      height: 32,
+                      fontSize: '0.85rem',
+                      fontWeight: 700,
                       bgcolor: 'primary.main',
                       boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
                     }}
@@ -373,53 +507,34 @@ export default function App() {
                     {userInfo.full_name.charAt(0)}
                   </Avatar>
                   <Box sx={{ overflow: 'hidden' }}>
-                      <Typography variant="body2" sx={{ fontWeight: 700, fontSize: '0.8rem', lineHeight: 1.2 }} noWrap>
-                          {userInfo.full_name}
-                      </Typography>
-                      <Typography variant="caption" sx={{ color: 'text.disabled', fontSize: '0.65rem' }} noWrap>
-                          @{userInfo.username}
-                      </Typography>
+                    <Typography variant="body2" sx={{ fontWeight: 700, fontSize: '0.8rem', lineHeight: 1.2 }} noWrap>
+                      {userInfo.full_name}
+                    </Typography>
+                    <Typography variant="caption" sx={{ color: 'text.disabled', fontSize: '0.65rem' }} noWrap>
+                      @{userInfo.username}
+                    </Typography>
                   </Box>
                 </Box>
               )}
 
               <Box sx={{ display: "flex", gap: 0.5, ml: -0.5 }}>
-                <Tooltip title="View Style" arrow>
-                  <IconButton 
-                    size="small" 
-                    onClick={(e) => setSettingsAnchor(e.currentTarget)} 
-                    sx={{ color: "text.secondary", "&:hover": { color: "primary.main" } }}
-                  >
-                    <Settings sx={{ fontSize: 18 }} />
-                  </IconButton>
-                </Tooltip>
-                
-                <Tooltip title={darkMode ? "Light Mode" : "Dark Mode"} arrow>
-                  <IconButton 
-                    size="small" 
-                    onClick={() => setDarkMode((d) => !d)} 
-                    sx={{ color: "text.secondary", "&:hover": { color: "primary.main" } }}
-                  >
-                    {darkMode ? <LightMode sx={{ fontSize: 18 }} /> : <DarkMode sx={{ fontSize: 18 }} />}
-                  </IconButton>
-                </Tooltip>
+                <IconButton size="small" onClick={(e) => setSettingsAnchor(e.currentTarget)} sx={{ color: "text.secondary" }}>
+                  <Settings sx={{ fontSize: 18 }} />
+                </IconButton>
+                <IconButton size="small" onClick={() => setDarkMode((d) => !d)} sx={{ color: "text.secondary" }}>
+                  {darkMode ? <LightMode sx={{ fontSize: 18 }} /> : <DarkMode sx={{ fontSize: 18 }} />}
+                </IconButton>
               </Box>
             </Box>
 
-            <Menu 
-              anchorEl={settingsAnchor} 
-              open={Boolean(settingsAnchor)} 
-              onClose={() => setSettingsAnchor(null)} 
-              anchorOrigin={{ vertical: 'top', horizontal: 'right' }} 
-              transformOrigin={{ vertical: 'bottom', horizontal: 'left' }}
-            >
+            <Menu anchorEl={settingsAnchor} open={Boolean(settingsAnchor)} onClose={() => setSettingsAnchor(null)} anchorOrigin={{ vertical: 'top', horizontal: 'right' }} transformOrigin={{ vertical: 'bottom', horizontal: 'left' }}>
               <MenuItem onClick={() => { setViewStyle('gmail'); setSettingsAnchor(null); }} selected={viewStyle === 'gmail'}>
                 <ListItemIcon><Email sx={{ fontSize: 18 }} /></ListItemIcon>
-                <ListItemText primary="Gmail View" primaryTypographyProps={{ fontSize: '0.8rem' }} />
+                <ListItemText primary="Gmail View" />
               </MenuItem>
               <MenuItem onClick={() => { setViewStyle('outlook'); setSettingsAnchor(null); }} selected={viewStyle === 'outlook'}>
                 <ListItemIcon><ViewStream sx={{ fontSize: 18 }} /></ListItemIcon>
-                <ListItemText primary="Outlook View" primaryTypographyProps={{ fontSize: '0.8rem' }} />
+                <ListItemText primary="Outlook View" />
               </MenuItem>
             </Menu>
           </Box>
@@ -437,15 +552,17 @@ export default function App() {
               <TextField
                 size="small"
                 variant="outlined"
-                placeholder="Search mail..."
+                placeholder="Search Archive..."
                 value={searchQuery}
                 onChange={(e) => handleSearch(e.target.value)}
-                InputProps={{
-                  startAdornment: (
-                    <InputAdornment position="start">
-                      <Search sx={{ fontSize: 16, color: "text.disabled" }} />
-                    </InputAdornment>
-                  ),
+                slotProps={{
+                  input: {
+                    startAdornment: (
+                      <InputAdornment position="start">
+                        <Search sx={{ fontSize: 16, color: "text.disabled" }} />
+                      </InputAdornment>
+                    ),
+                  }
                 }}
                 sx={{
                   width: 520,
@@ -472,10 +589,8 @@ export default function App() {
               )
             ) : (
               <Box sx={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
-                {/* MIDDLE PANE */}
                 <Box sx={{ width: OUTLOOK_LIST_WIDTH, flexShrink: 0, borderRight: '1px solid', borderColor: 'divider', bgcolor: darkMode ? '#141414' : '#fff', display: 'flex', flexDirection: 'column' }}>
 
-                  {/* Sorting Header */}
                   <Box sx={{ px: 2, py: 1.5, display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '1px solid', borderColor: 'divider' }}>
                     <Typography variant="caption" sx={{ fontWeight: 800, color: 'text.disabled', letterSpacing: 0.5 }}>
                       {sortOrder === 'newest' ? 'NEWEST ON TOP' : 'OLDEST ON TOP'}
@@ -494,7 +609,7 @@ export default function App() {
                   <List sx={{ flexGrow: 1, overflowY: 'auto', p: 0 }}>
                     {sortedEmails.length === 0 ? (
                       <Box sx={{ p: 4, textAlign: 'center', opacity: 0.5 }}>
-                        <Typography variant="body2">No items to show.</Typography>
+                        <Typography variant="body2">No emails in this folder.</Typography>
                       </Box>
                     ) : (
                       sortedEmails.map((email) => (

@@ -24,6 +24,14 @@ struct UserInfo {
     full_name: String,
 }
 
+#[derive(serde::Serialize)]
+struct FileNode {
+    name: String,
+    path: String,
+    is_dir: bool,
+    children: Vec<FileNode>,
+}
+
 fn find_body(part: &ParsedMail) -> Option<String> {
     let content_type = part.headers.get_first_value("Content-Type").unwrap_or_default().to_lowercase();
     if content_type.contains("text/plain") {
@@ -122,13 +130,73 @@ async fn index_folder(app: tauri::AppHandle, folder_path: String) -> Result<Stri
 }
 
 #[tauri::command]
-fn search_emails(app: tauri::AppHandle, query: String) -> Result<Vec<EmailResult>, String> {
+fn get_file_tree(root_path: String) -> Result<FileNode, String> {
+    fn build_tree(path: &std::path::Path) -> Result<FileNode, String> {
+        let name = path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let mut children = Vec::new();
+
+        if path.is_dir() {
+            let entries = std::fs::read_dir(path).map_err(|e| e.to_string())?;
+            for entry in entries {
+                let entry = entry.map_err(|e| e.to_string())?;
+                let p = entry.path();
+                if p.is_dir() {
+                    if let Ok(child) = build_tree(&p) {
+                        children.push(child);
+                    }
+                }
+            }
+            // Sort alphabetical
+            children.sort_by(|a, b| {
+                a.name.to_lowercase().cmp(&b.name.to_lowercase())
+            });
+        }
+
+        Ok(FileNode {
+            name,
+            path: path.to_str().unwrap_or_default().to_string(),
+            is_dir: path.is_dir(),
+            children,
+        })
+    }
+
+    build_tree(std::path::Path::new(&root_path))
+}
+
+#[tauri::command]
+fn search_emails(app: tauri::AppHandle, query: String, path_filter: Option<String>) -> Result<Vec<EmailResult>, String> {
     let conn = get_db(&app)?;
-    let (sql, params_vec) = if query.trim().is_empty() {
-        ("SELECT subject, sender, recipient, date, body, path, has_attachments FROM emails ORDER BY date DESC LIMIT 100".to_string(), vec![])
+    let mut params_vec: Vec<String> = Vec::new();
+    
+    let mut sql = "SELECT subject, sender, recipient, date, body, path, has_attachments FROM emails".to_string();
+    let mut conditions = Vec::new();
+
+    if !query.trim().is_empty() {
+        conditions.push("emails MATCH ?".to_string());
+        params_vec.push(format!("{}*", query.trim()));
+    }
+
+    if let Some(ref filter) = path_filter {
+        conditions.push("path LIKE ?".to_string());
+        params_vec.push(format!("{}%", filter));
+    }
+
+    if !conditions.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&conditions.join(" AND "));
+    }
+
+    if query.trim().is_empty() {
+        sql.push_str(" ORDER BY date DESC");
     } else {
-        ("SELECT subject, sender, recipient, date, body, path, has_attachments FROM emails WHERE emails MATCH ? ORDER BY rank LIMIT 100".to_string(), vec![format!("{}*", query.trim())])
-    };
+        sql.push_str(" ORDER BY rank");
+    }
+    
+    sql.push_str(" LIMIT 100");
+
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
         Ok(EmailResult { 
@@ -141,6 +209,7 @@ fn search_emails(app: tauri::AppHandle, query: String) -> Result<Vec<EmailResult
             has_attachments: row.get::<_, i32>(6)? == 1
         })
     }).map_err(|e| e.to_string())?;
+    
     let mut results = Vec::new();
     for row in rows { if let Ok(res) = row { results.push(res); } }
     Ok(results)
@@ -176,7 +245,7 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![index_folder, search_emails, open_eml, get_registered_path, get_user_info])
+        .invoke_handler(tauri::generate_handler![index_folder, search_emails, open_eml, get_registered_path, get_user_info, get_file_tree])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
