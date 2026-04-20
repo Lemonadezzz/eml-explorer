@@ -14,20 +14,25 @@ struct EmailResult {
     path: String,
 }
 
-// Fixed: get_db now ensures the directory and tables exist in the secure AppData folder
 fn get_db(app: &tauri::AppHandle) -> Result<Connection, String> {
     let app_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&app_dir).map_err(|e| e.to_string())?;
-    
     let db_path = app_dir.join("cache.db");
     let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
-    
-    // Ensure tables exist
+
+    // Auto-heal: If it detects the complex multi-folder schema, wipe it cleanly to reset
+    if conn.execute("SELECT location_path FROM emails LIMIT 1", []).is_ok() {
+        let _ = conn.execute("DROP TABLE IF EXISTS emails", []);
+        let _ = conn.execute("DROP TABLE IF EXISTS locations", []);
+    }
+
+    // Classic config table for a single folder path
     conn.execute(
         "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)",
         [],
     ).map_err(|e| e.to_string())?;
-    
+
+    // Classic FTS5 without UNINDEXED constraints
     conn.execute(
         "CREATE VIRTUAL TABLE IF NOT EXISTS emails USING fts5(subject, sender, body, date, path)",
         [],
@@ -65,14 +70,12 @@ async fn index_folder(app: tauri::AppHandle, folder_path: String) -> Result<Stri
                 if let Ok(parsed) = parse_mail(&content) {
                     let subject = parsed.headers.get_first_value("Subject").unwrap_or_default();
                     let sender = parsed.headers.get_first_value("From").unwrap_or_default();
-                    
                     let raw_date = parsed.headers.get_first_value("Date").unwrap_or_default();
                     let formatted_date = mailparse::dateparse(&raw_date)
                         .ok()
                         .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
                         .map(|dt| dt.format("%b %d, %Y %I:%M %p").to_string())
                         .unwrap_or(raw_date);
-                    
                     let body = parsed.get_body().unwrap_or_default();
                     let path = entry.path().to_str().unwrap_or_default();
 
@@ -84,17 +87,17 @@ async fn index_folder(app: tauri::AppHandle, folder_path: String) -> Result<Stri
             }
         }
     }
-    Ok("Indexing complete".into())
+    Ok("Folder Synced".into())
 }
 
 #[tauri::command]
 fn search_emails(app: tauri::AppHandle, query: String) -> Result<Vec<EmailResult>, String> {
     let conn = get_db(&app)?;
     
-    let (sql, params_vec) = if query.is_empty() {
+    let (sql, params_vec) = if query.trim().is_empty() {
         ("SELECT subject, sender, date, path FROM emails ORDER BY rowid DESC LIMIT 100".to_string(), vec![])
     } else {
-        ("SELECT subject, sender, date, path FROM emails WHERE emails MATCH ? ORDER BY rank LIMIT 100".to_string(), vec![format!("{}*", query)])
+        ("SELECT subject, sender, date, path FROM emails WHERE emails MATCH ? ORDER BY rank LIMIT 100".to_string(), vec![format!("{}*", query.trim())])
     };
 
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
