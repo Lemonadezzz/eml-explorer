@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 
@@ -7,11 +7,14 @@ import { ThemeProvider } from "@mui/material/styles";
 import {
   Box, CssBaseline, AppBar, Toolbar, Typography, TextField,
   IconButton, Divider, Drawer, InputAdornment, Tooltip,
-  Chip,
+  Chip, CircularProgress, Menu, MenuItem, ListItemIcon, ListItemText,
+  List, ListItemButton, Avatar
 } from "@mui/material";
 import {
   Search, FolderOpen, OpenInNew,
   DarkMode, LightMode, DriveFileMove,
+  AttachFile, ArrowBack, Settings,
+  Email, ViewStream, SortRounded
 } from "@mui/icons-material";
 import { DataGrid, type GridColDef } from "@mui/x-data-grid";
 
@@ -19,20 +22,50 @@ import { DataGrid, type GridColDef } from "@mui/x-data-grid";
 import { getTheme } from "./theme";
 
 const DRAWER_WIDTH = 240;
-const APP_VERSION = "v0.8.0";
+const OUTLOOK_LIST_WIDTH = 380;
+const APP_VERSION = "v0.9.0";
 
-const columns: GridColDef[] = [
-  {
-    field: "sender",
-    headerName: "From",
-    flex: 1,
-    minWidth: 200,
-    valueGetter: (value: any) =>
-      typeof value === "string" ? value.split("<")[0].trim() : "",
-  },
-  { field: "subject", headerName: "Subject", flex: 2, minWidth: 300 },
-  { field: "date", headerName: "Received", width: 200 },
-];
+const formatFullDate = (isoString: string) => {
+  try {
+    const date = new Date(isoString);
+    if (isNaN(date.getTime())) return isoString;
+    return date.toLocaleString([], {
+      weekday: 'short',
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true
+    });
+  } catch {
+    return isoString;
+  }
+};
+
+const formatDate = (dateValue: any) => {
+  if (!dateValue) return "Unknown";
+  const isoString = typeof dateValue === 'string' ? dateValue : dateValue.value;
+  if (!isoString || typeof isoString !== 'string') return "Unknown";
+
+  try {
+    const date = new Date(isoString);
+    if (isNaN(date.getTime())) return isoString;
+    const now = new Date();
+    const isToday = date.toDateString() === now.toDateString();
+    const isThisYear = date.getFullYear() === now.getFullYear();
+
+    if (isToday) {
+      return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true });
+    } else if (isThisYear) {
+      return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+    } else {
+      return date.toLocaleDateString([], { month: 'numeric', day: 'numeric', year: '2-digit' });
+    }
+  } catch {
+    return isoString;
+  }
+};
 
 export default function App() {
   const [emails, setEmails] = useState<any[]>([]);
@@ -40,53 +73,218 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [folderPath, setFolderPath] = useState<string | null>(null);
   const [darkMode, setDarkMode] = useState(true);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [viewStyle, setViewStyle] = useState<'gmail' | 'outlook'>('outlook');
+  const [sortOrder, setSortOrder] = useState<'newest' | 'oldest'>('newest');
+  const [userInfo, setUserInfo] = useState<any>(null);
+
+  const [settingsAnchor, setSettingsAnchor] = useState<null | HTMLElement>(null);
 
   const theme = useMemo(() => getTheme(darkMode ? "dark" : "light"), [darkMode]);
 
-  // Load saved archive on startup
+  // Handle Escape key to deselect
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setSelectedEmail(null);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
+  const fetchEmails = useCallback(async (query: string) => {
+    try {
+      const data = await invoke<any[]>("search_emails", { query });
+      setEmails(data);
+    } catch (e) {
+      console.error("Search error:", e);
+    }
+  }, []);
+
   useEffect(() => {
     const init = async () => {
-      const saved = await invoke<string | null>("get_registered_path");
-      if (saved) {
-        setFolderPath(saved);
-        const data = await invoke<any[]>("search_emails", { query: "" });
-        setEmails(data);
+      try {
+        const saved = await invoke<string | null>("get_registered_path");
+        if (saved) {
+          setFolderPath(saved);
+          fetchEmails("");
+        }
+        const user = await invoke<any>("get_user_info");
+        setUserInfo(user);
+      } catch (e) {
+        console.error("Initialization error:", e);
       }
     };
     init();
-  }, []);
+  }, [fetchEmails]);
 
   const handleRegisterFolder = async () => {
     try {
       const selected = await open({ directory: true, multiple: false });
       if (selected && typeof selected === "string") {
+        setIsSyncing(true);
         await invoke("index_folder", { folderPath: selected });
         setFolderPath(selected);
-        const data = await invoke<any[]>("search_emails", { query: searchQuery });
-        setEmails(data);
+        fetchEmails(searchQuery);
+        setIsSyncing(false);
       }
     } catch (e) {
       console.error("Failed to register folder:", e);
+      setIsSyncing(false);
     }
   };
 
   const handleSearch = async (val: string) => {
     setSearchQuery(val);
-    const data = await invoke<any[]>("search_emails", { query: val });
-    setEmails(data);
+    fetchEmails(val);
   };
 
-  // Full path broken into segments
+  // Sort emails based on sortOrder
+  const sortedEmails = useMemo(() => {
+    const sorted = [...emails];
+    sorted.sort((a, b) => {
+      const dateA = new Date(a.date).getTime();
+      const dateB = new Date(b.date).getTime();
+      return sortOrder === 'newest' ? dateB - dateA : dateA - dateB;
+    });
+    return sorted;
+  }, [emails, sortOrder]);
+
+  const gmailColumns = useMemo<GridColDef[]>(() => [
+    {
+      field: "sender",
+      headerName: "From",
+      width: 200,
+      renderCell: (params) => (
+        <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+          <Typography variant="body2" sx={{ fontWeight: 700, fontSize: '0.75rem' }}>
+            {(typeof params.value === "string" && params.value) ? params.value.split("<")[0].trim() : "Unknown"}
+          </Typography>
+        </Box>
+      )
+    },
+    {
+      field: "subject",
+      headerName: "Subject",
+      flex: 1,
+      minWidth: 400,
+      renderCell: (params) => (
+        <Box sx={{ display: 'flex', alignItems: 'center', overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis', height: '100%' }}>
+          <Typography variant="body2" sx={{ fontWeight: 700, mr: 1, flexShrink: 0, fontSize: '0.75rem', fontFamily: '"Outfit", sans-serif' }}>
+            {params.row.subject}
+          </Typography>
+          <Typography variant="body2" sx={{ color: 'text.secondary', fontSize: '0.75rem', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            — {params.row.body.replace(/\n/g, ' ').substring(0, 100)}
+          </Typography>
+        </Box>
+      ),
+    },
+    {
+      field: "has_attachments",
+      headerName: "",
+      width: 40,
+      renderCell: (params) => (
+        <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
+          {params.value ? (
+            <Tooltip title="With Attachment">
+              <AttachFile sx={{ fontSize: 14, color: 'text.disabled' }} />
+            </Tooltip>
+          ) : null}
+        </Box>
+      )
+    },
+    {
+      field: "date",
+      headerName: "Date",
+      width: 150,
+      renderCell: (params) => (
+        <Box sx={{ display: 'flex', alignItems: 'center', height: '100%', justifyContent: 'flex-end', width: '100%' }}>
+          <Typography variant="body2" sx={{ fontSize: '0.75rem', fontWeight: 700, color: 'text.primary' }}>
+            {formatDate(params.value)}
+          </Typography>
+        </Box>
+      )
+    },
+  ], []);
+
   const pathSegments = folderPath
     ? folderPath.replace(/\\/g, "/").split("/").filter(Boolean)
     : [];
+
+  const renderEmailDetail = (email: any) => (
+    <Box
+      sx={{
+        bgcolor: "background.paper",
+        height: "100%",
+        borderRadius: viewStyle === 'outlook' ? 0 : 2,
+        p: 4,
+        overflowY: "auto",
+        boxShadow: viewStyle === 'outlook' ? 'none' : (darkMode
+          ? "0 0 0 1px rgba(255,255,255,0.06)"
+          : "0 0 0 1px rgba(0,0,0,0.07)"),
+      }}
+    >
+      <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", mb: 3 }}>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+          <Typography sx={{ fontWeight: 700, fontSize: "1.15rem", fontFamily: '"Outfit", sans-serif' }}>
+            {email.subject}
+          </Typography>
+          {email.has_attachments && (
+            <Chip label="With Attachment" size="small" icon={<AttachFile sx={{ fontSize: '10px !important' }} />} variant="outlined" sx={{ height: 20, fontSize: '0.65rem' }} />
+          )}
+        </Box>
+        <Tooltip title="Open in mail client">
+          <IconButton
+            size="small"
+            color="primary"
+            onClick={() => invoke("open_eml", { path: email.path })}
+          >
+            <OpenInNew sx={{ fontSize: 18 }} />
+          </IconButton>
+        </Tooltip>
+      </Box>
+
+      <Divider sx={{ mb: 2 }} />
+
+      <Typography variant="body2" sx={{ mb: 0.5, fontWeight: 500 }}>
+        <b>From:</b>&nbsp;{email.sender}
+      </Typography>
+      <Typography variant="body2" sx={{ mb: 0.5, fontWeight: 500 }}>
+        <b>To:</b>&nbsp;{email.recipient}
+      </Typography>
+      <Typography variant="body2" sx={{ mb: 0.5, fontWeight: 500 }}>
+        <b>Date:</b>&nbsp;{formatFullDate(email.date)}
+      </Typography>
+      <Typography
+        variant="caption"
+        sx={{ display: "block", mb: 3, color: "text.secondary", wordBreak: "break-all", opacity: 0.7 }}
+      >
+        <b>Path:</b>&nbsp;{email.path}
+      </Typography>
+
+      <Divider sx={{ mb: 3 }} />
+
+      <Box
+        sx={{
+          whiteSpace: "pre-wrap",
+          overflowWrap: "break-word",
+          color: "text.primary",
+          fontSize: "0.85rem",
+          lineHeight: 1.8,
+          width: '100%',
+        }}
+      >
+        {email.body || "No content available."}
+      </Box>
+    </Box>
+  );
 
   return (
     <ThemeProvider theme={theme}>
       <Box sx={{ display: "flex", height: "100vh", bgcolor: "background.default" }}>
         <CssBaseline />
 
-        {/* ─────────────── SIDEBAR ─────────────── */}
         <Drawer
           variant="permanent"
           sx={{
@@ -100,205 +298,154 @@ export default function App() {
             },
           }}
         >
-          {/* Logo block */}
-          <Box
-            sx={{
-              height: 52,
-              display: "flex",
-              alignItems: "center",
-              gap: 0.75,
-              px: 2,
-              borderBottom: "1px solid",
-              borderColor: "divider",
-            }}
-          >
-            <Typography
-              sx={{
-                fontWeight: 800,
-                fontSize: "0.95rem",
-                lineHeight: 1,
-                color: "primary.main",
-                letterSpacing: "-0.5px",
-              }}
-            >
-              eml-explorer
-            </Typography>
-            <Typography
-              sx={{
-                fontSize: "0.62rem",
-                lineHeight: 1,
-                color: "text.disabled",
-              }}
-            >
-              {APP_VERSION}
-            </Typography>
+          <Box sx={{ height: 52, display: "flex", alignItems: "center", px: 2, borderBottom: "1px solid", borderColor: "divider" }}>
+            <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 1 }}>
+              <Typography sx={{ fontWeight: 800, fontSize: "1rem", color: "primary.main", letterSpacing: "-0.5px", fontFamily: '"Outfit", sans-serif', lineHeight: 1 }}>
+                eml-explorer
+              </Typography>
+              <Typography sx={{ fontSize: "0.65rem", color: "text.disabled", fontWeight: 500 }}>
+                {APP_VERSION}
+              </Typography>
+            </Box>
           </Box>
 
-          {/* Content */}
           <Box sx={{ flexGrow: 1, overflow: "hidden", display: "flex", flexDirection: "column", p: 1.5 }}>
-
-            {/* ── CURRENT ARCHIVE label + change icon ── */}
             <Box sx={{ display: "flex", alignItems: "center", mb: 0.5, px: 0.5 }}>
-              <Typography
-                variant="caption"
-                sx={{ fontWeight: 700, letterSpacing: 1, color: "text.disabled", flexGrow: 1, fontSize: "0.6rem" }}
-              >
-                CURRENT ARCHIVE
+              <Typography variant="caption" sx={{ fontWeight: 700, letterSpacing: 1, color: "text.disabled", flexGrow: 1, fontSize: "0.6rem", fontFamily: '"Outfit", sans-serif' }}>
+                ARCHIVE
               </Typography>
               <Tooltip title="Change archive location" placement="right" arrow>
-                <IconButton
-                  size="small"
-                  onClick={handleRegisterFolder}
-                  sx={{ p: 0.4, color: "text.disabled", "&:hover": { color: "primary.main" } }}
-                >
+                <IconButton size="small" disabled={isSyncing} onClick={handleRegisterFolder} sx={{ p: 0.4, color: "text.disabled", "&:hover": { color: "primary.main" } }}>
                   <DriveFileMove sx={{ fontSize: 14 }} />
                 </IconButton>
               </Tooltip>
             </Box>
 
-            {/* ── Archive path card ── */}
             {folderPath ? (
-              <Tooltip title={folderPath} placement="right" arrow>
-                <Box
-                  sx={{
-                    bgcolor: "action.selected",
-                    borderRadius: 1.5,
-                    p: 1.25,
-                    mb: 1,
-                    cursor: "default",
-                  }}
-                >
-                  {/* Folder name + badge */}
-                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.75, mb: 0.75 }}>
-                    <FolderOpen sx={{ fontSize: 14, color: "primary.main" }} />
-                    <Typography
-                      variant="caption"
-                      sx={{ fontWeight: 700, color: "text.primary", flexGrow: 1, fontSize: "0.72rem" }}
-                      noWrap
-                    >
-                      {pathSegments[pathSegments.length - 1]}
-                    </Typography>
-                    <Chip
-                      label="Indexed"
-                      size="small"
-                      color="success"
-                      sx={{ height: 16, fontSize: "0.55rem", fontWeight: 700, px: 0.25 }}
-                    />
-                  </Box>
-
-                  {/* Full path as breadcrumb */}
-                  <Box sx={{ display: "flex", flexDirection: "column", gap: 0.1 }}>
-                    {pathSegments.map((seg, i) => (
-                      <Box key={i} sx={{ display: "flex", alignItems: "center" }}>
-                        <Box sx={{ width: i * 6, minWidth: i * 6 }} />
-                        <Typography
-                          variant="caption"
-                          sx={{
-                            fontSize: "0.6rem",
-                            lineHeight: 1.5,
-                            color:
-                              i === pathSegments.length - 1
-                                ? "text.primary"
-                                : "text.disabled",
-                            fontWeight: i === pathSegments.length - 1 ? 600 : 400,
-                          }}
-                          noWrap
-                        >
-                          {i > 0 ? "›  " : "/"}{seg}
-                        </Typography>
-                      </Box>
-                    ))}
-                  </Box>
+              <Box sx={{ bgcolor: "action.selected", borderRadius: 1.5, p: 1.25, mb: 1 }}>
+                <Box sx={{ display: "flex", alignItems: "center", gap: 0.75, mb: 0.75 }}>
+                  <FolderOpen sx={{ fontSize: 14, color: "primary.main" }} />
+                  <Typography variant="caption" sx={{ fontWeight: 700, color: "text.primary", flexGrow: 1, fontSize: "0.72rem", fontFamily: '"Outfit", sans-serif' }} noWrap>
+                    {pathSegments[pathSegments.length - 1]}
+                  </Typography>
+                  {isSyncing && <CircularProgress size={10} color="primary" />}
                 </Box>
-              </Tooltip>
+                <Box sx={{ display: "flex", flexDirection: "column", gap: 0.1 }}>
+                  {pathSegments.slice(-3).map((seg, i) => (
+                    <Typography key={i} variant="caption" sx={{ fontSize: "0.6rem", color: "text.disabled" }} noWrap>
+                      {i > 0 ? "› " : "/"}{seg}
+                    </Typography>
+                  ))}
+                </Box>
+              </Box>
             ) : (
-              <Box
-                onClick={handleRegisterFolder}
-                sx={{
-                  border: "1px dashed",
-                  borderColor: "divider",
-                  borderRadius: 1.5,
-                  p: 1.5,
-                  mb: 1,
-                  cursor: "pointer",
-                  textAlign: "center",
-                  "&:hover": { borderColor: "primary.main", bgcolor: "action.hover" },
-                  transition: "all 0.15s",
-                }}
-              >
+              <Box onClick={handleRegisterFolder} sx={{ border: "1px dashed", borderColor: "divider", borderRadius: 1.5, p: 1.5, textAlign: "center", cursor: "pointer", "&:hover": { borderColor: "primary.main" } }}>
                 <FolderOpen sx={{ fontSize: 22, color: "text.disabled", mb: 0.5 }} />
-                <Typography variant="caption" sx={{ display: "block", color: "text.disabled", fontWeight: 500 }}>
-                  Open Archive
-                </Typography>
+                <Typography variant="caption" sx={{ display: "block", color: "text.disabled" }}>Open Archive</Typography>
               </Box>
             )}
 
             <Divider sx={{ my: 1 }} />
-
-            {/* Email count */}
             {emails.length > 0 && (
-              <Typography
-                variant="caption"
-                sx={{ color: "text.disabled", px: 0.5, fontSize: "0.65rem" }}
-              >
-                {emails.length.toLocaleString()} emails indexed
+              <Typography variant="caption" sx={{ color: "text.disabled", px: 0.5, fontSize: "0.65rem" }}>
+                {emails.length.toLocaleString()} items
               </Typography>
             )}
-
-            {/* Spacer */}
+            
             <Box sx={{ flexGrow: 1 }} />
+            
+            {/* User Info and Toggles Section Below the Line */}
+            <Divider />
+            
+            <Box sx={{ p: 2 }}>
+              {userInfo && (
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 1.5 }}>
+                  <Avatar 
+                    sx={{ 
+                      width: 32, 
+                      height: 32, 
+                      fontSize: '0.85rem', 
+                      fontWeight: 700, 
+                      bgcolor: 'primary.main',
+                      boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
+                    }}
+                  >
+                    {userInfo.full_name.charAt(0)}
+                  </Avatar>
+                  <Box sx={{ overflow: 'hidden' }}>
+                      <Typography variant="body2" sx={{ fontWeight: 700, fontSize: '0.8rem', lineHeight: 1.2 }} noWrap>
+                          {userInfo.full_name}
+                      </Typography>
+                      <Typography variant="caption" sx={{ color: 'text.disabled', fontSize: '0.65rem' }} noWrap>
+                          @{userInfo.username}
+                      </Typography>
+                  </Box>
+                </Box>
+              )}
 
-            {/* ── Dark mode toggle (bottom of sidebar) ── */}
-            <Divider sx={{ mb: 1 }} />
-            <Box sx={{ display: "flex", alignItems: "center", px: 0.5, pb: 0.5 }}>
-              <Typography variant="caption" sx={{ color: "text.disabled", flexGrow: 1, fontSize: "0.65rem" }}>
-                {darkMode ? "Dark" : "Light"} mode
-              </Typography>
-              <Tooltip title={darkMode ? "Switch to Light Mode" : "Switch to Dark Mode"} placement="right" arrow>
-                <IconButton
-                  size="small"
-                  onClick={() => setDarkMode((d) => !d)}
-                  sx={{ color: "text.secondary", "&:hover": { color: "primary.main" } }}
-                >
-                  {darkMode ? <LightMode sx={{ fontSize: 16 }} /> : <DarkMode sx={{ fontSize: 16 }} />}
-                </IconButton>
-              </Tooltip>
+              <Box sx={{ display: "flex", gap: 0.5, ml: -0.5 }}>
+                <Tooltip title="View Style" arrow>
+                  <IconButton 
+                    size="small" 
+                    onClick={(e) => setSettingsAnchor(e.currentTarget)} 
+                    sx={{ color: "text.secondary", "&:hover": { color: "primary.main" } }}
+                  >
+                    <Settings sx={{ fontSize: 18 }} />
+                  </IconButton>
+                </Tooltip>
+                
+                <Tooltip title={darkMode ? "Light Mode" : "Dark Mode"} arrow>
+                  <IconButton 
+                    size="small" 
+                    onClick={() => setDarkMode((d) => !d)} 
+                    sx={{ color: "text.secondary", "&:hover": { color: "primary.main" } }}
+                  >
+                    {darkMode ? <LightMode sx={{ fontSize: 18 }} /> : <DarkMode sx={{ fontSize: 18 }} />}
+                  </IconButton>
+                </Tooltip>
+              </Box>
             </Box>
+
+            <Menu 
+              anchorEl={settingsAnchor} 
+              open={Boolean(settingsAnchor)} 
+              onClose={() => setSettingsAnchor(null)} 
+              anchorOrigin={{ vertical: 'top', horizontal: 'right' }} 
+              transformOrigin={{ vertical: 'bottom', horizontal: 'left' }}
+            >
+              <MenuItem onClick={() => { setViewStyle('gmail'); setSettingsAnchor(null); }} selected={viewStyle === 'gmail'}>
+                <ListItemIcon><Email sx={{ fontSize: 18 }} /></ListItemIcon>
+                <ListItemText primary="Gmail View" primaryTypographyProps={{ fontSize: '0.8rem' }} />
+              </MenuItem>
+              <MenuItem onClick={() => { setViewStyle('outlook'); setSettingsAnchor(null); }} selected={viewStyle === 'outlook'}>
+                <ListItemIcon><ViewStream sx={{ fontSize: 18 }} /></ListItemIcon>
+                <ListItemText primary="Outlook View" primaryTypographyProps={{ fontSize: '0.8rem' }} />
+              </MenuItem>
+            </Menu>
           </Box>
         </Drawer>
 
-        {/* ─────────────── MAIN ─────────────── */}
-        <Box
-          component="main"
-          sx={{ flexGrow: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}
-        >
-          {/* Top Bar — search centred */}
+        <Box component="main" sx={{ flexGrow: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+
           <AppBar position="static" elevation={0}>
             <Toolbar sx={{ justifyContent: "center" }}>
-              {selectedEmail && (
-                <Tooltip title="Back to list">
-                  <IconButton
-                    onClick={() => setSelectedEmail(null)}
-                    sx={{ position: "absolute", left: 16, color: "inherit" }}
-                  >
-                    <Search sx={{ fontSize: 20 }} />
-                  </IconButton>
-                </Tooltip>
+              {viewStyle === 'gmail' && selectedEmail && (
+                <IconButton onClick={() => setSelectedEmail(null)} sx={{ position: "absolute", left: 16, color: "inherit" }}>
+                  <ArrowBack sx={{ fontSize: 20 }} />
+                </IconButton>
               )}
               <TextField
                 size="small"
                 variant="outlined"
-                placeholder="Search current mailbox…"
+                placeholder="Search mail..."
                 value={searchQuery}
                 onChange={(e) => handleSearch(e.target.value)}
-                slotProps={{
-                  input: {
-                    startAdornment: (
-                      <InputAdornment position="start">
-                        <Search sx={{ fontSize: 16, color: "text.disabled" }} />
-                      </InputAdornment>
-                    ),
-                  },
+                InputProps={{
+                  startAdornment: (
+                    <InputAdornment position="start">
+                      <Search sx={{ fontSize: 16, color: "text.disabled" }} />
+                    </InputAdornment>
+                  ),
                 }}
                 sx={{
                   width: 520,
@@ -313,109 +460,96 @@ export default function App() {
             </Toolbar>
           </AppBar>
 
-          {/* Content */}
-          <Box sx={{ flexGrow: 1, p: 1.5, display: "flex", flexDirection: "column", overflow: "hidden" }}>
-            {!selectedEmail ? (
-              /* ── Email List ── */
-              <Box
-                sx={{
-                  flex: 1,
-                  display: "flex",
-                  flexDirection: "column",
-                  bgcolor: "background.paper",
-                  borderRadius: 2,
-                  overflow: "hidden",
-                  boxShadow: darkMode
-                    ? "0 0 0 1px rgba(255,255,255,0.06)"
-                    : "0 0 0 1px rgba(0,0,0,0.07)",
-                }}
-              >
-                {emails.length === 0 ? (
-                  <Box
-                    sx={{
-                      flex: 1,
-                      display: "flex",
-                      flexDirection: "column",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      gap: 1.5,
-                    }}
-                  >
-                    <FolderOpen sx={{ fontSize: 44, color: "text.disabled" }} />
-                    <Typography sx={{ color: "text.secondary", fontSize: "0.85rem" }}>
-                      No emails found. Open an archive folder to begin.
-                    </Typography>
-                  </Box>
-                ) : (
-                  <DataGrid
-                    rows={emails}
-                    getRowId={(row) => row.path}
-                    columns={columns}
-                    checkboxSelection
-                    disableRowSelectionOnClick
-                    onRowClick={(params, event) => {
-                      const target = event.target as HTMLElement;
-                      if (!target.closest(".MuiCheckbox-root")) {
-                        setSelectedEmail(params.row);
-                      }
-                    }}
-                    pagination
-                    initialState={{
-                      pagination: { paginationModel: { pageSize: 50 } },
-                    }}
-                    pageSizeOptions={[25, 50, 100]}
-                    sx={{ border: "none" }}
-                  />
-                )}
-              </Box>
+          <Box sx={{ flexGrow: 1, p: viewStyle === 'outlook' ? 0 : 1.5, display: "flex", overflow: "hidden" }}>
+
+            {viewStyle === 'gmail' ? (
+              !selectedEmail ? (
+                <Box sx={{ flex: 1, bgcolor: "background.paper", borderRadius: 2, overflow: "hidden", boxShadow: darkMode ? "0 0 0 1px rgba(255,255,255,0.06)" : "0 0 0 1px rgba(0,0,0,0.07)" }}>
+                  <DataGrid rows={sortedEmails} getRowId={(row) => row.path} columns={gmailColumns} checkboxSelection disableRowSelectionOnClick onRowClick={(params, event) => { if (!(event.target as HTMLElement).closest(".MuiCheckbox-root")) setSelectedEmail(params.row); }} pagination initialState={{ pagination: { paginationModel: { pageSize: 50 } } }} pageSizeOptions={[25, 50, 100]} sx={{ border: "none" }} />
+                </Box>
+              ) : (
+                renderEmailDetail(selectedEmail)
+              )
             ) : (
-              /* ── Email Detail ── */
-              <Box
-                sx={{
-                  bgcolor: "background.paper",
-                  height: "100%",
-                  borderRadius: 2,
-                  p: 4,
-                  overflowY: "auto",
-                  boxShadow: darkMode
-                    ? "0 0 0 1px rgba(255,255,255,0.06)"
-                    : "0 0 0 1px rgba(0,0,0,0.07)",
-                }}
-              >
-                <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", mb: 3 }}>
-                  <Typography sx={{ fontWeight: 700, fontSize: "1rem" }}>
-                    {selectedEmail.subject}
-                  </Typography>
-                  <Tooltip title="Open in mail client">
-                    <IconButton
-                      size="small"
-                      color="primary"
-                      onClick={() => invoke("open_eml", { path: selectedEmail.path })}
-                    >
-                      <OpenInNew sx={{ fontSize: 18 }} />
-                    </IconButton>
-                  </Tooltip>
+              <Box sx={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
+                {/* MIDDLE PANE */}
+                <Box sx={{ width: OUTLOOK_LIST_WIDTH, flexShrink: 0, borderRight: '1px solid', borderColor: 'divider', bgcolor: darkMode ? '#141414' : '#fff', display: 'flex', flexDirection: 'column' }}>
+
+                  {/* Sorting Header */}
+                  <Box sx={{ px: 2, py: 1.5, display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '1px solid', borderColor: 'divider' }}>
+                    <Typography variant="caption" sx={{ fontWeight: 800, color: 'text.disabled', letterSpacing: 0.5 }}>
+                      {sortOrder === 'newest' ? 'NEWEST ON TOP' : 'OLDEST ON TOP'}
+                    </Typography>
+                    <Tooltip title={sortOrder === 'newest' ? "Switch to Oldest on Top" : "Switch to Newest on Top"}>
+                      <IconButton
+                        size="small"
+                        onClick={() => setSortOrder(prev => prev === 'newest' ? 'oldest' : 'newest')}
+                        sx={{ color: 'text.secondary' }}
+                      >
+                        <SortRounded sx={{ fontSize: 16, transform: sortOrder === 'oldest' ? 'scaleY(-1)' : 'none' }} />
+                      </IconButton>
+                    </Tooltip>
+                  </Box>
+
+                  <List sx={{ flexGrow: 1, overflowY: 'auto', p: 0 }}>
+                    {sortedEmails.length === 0 ? (
+                      <Box sx={{ p: 4, textAlign: 'center', opacity: 0.5 }}>
+                        <Typography variant="body2">No items to show.</Typography>
+                      </Box>
+                    ) : (
+                      sortedEmails.map((email) => (
+                        <ListItemButton
+                          key={email.path}
+                          onClick={() => setSelectedEmail(email)}
+                          selected={selectedEmail?.path === email.path}
+                          sx={{
+                            display: 'flex',
+                            flexDirection: 'column',
+                            alignItems: 'flex-start',
+                            py: 1.5,
+                            px: 2,
+                            borderBottom: '1px solid',
+                            borderColor: 'divider',
+                            gap: 0.5,
+                            '&.Mui-selected': {
+                              bgcolor: 'primary.main', color: 'white', '&:hover': { bgcolor: 'primary.main' },
+                              '& .MuiTypography-root': { color: 'inherit' },
+                              '& .MuiSvgIcon-root': { color: 'inherit' }
+                            }
+                          }}
+                        >
+                          <Typography variant="body2" sx={{ fontWeight: 800, fontSize: '0.85rem' }} noWrap>
+                            {email.sender.split("<")[0].trim() || "Unknown"}
+                          </Typography>
+                          <Box sx={{ display: 'flex', width: '100%', justifyContent: 'space-between', alignItems: 'center' }}>
+                            <Typography variant="body2" sx={{ fontWeight: 600, fontSize: '0.75rem', flex: 1 }} noWrap>
+                              {email.subject}
+                            </Typography>
+                            <Typography variant="caption" sx={{ fontSize: '0.65rem', ml: 1, opacity: 0.8 }}>
+                              {formatDate(email.date)}
+                            </Typography>
+                          </Box>
+                          <Box sx={{ display: 'flex', width: '100%', alignItems: 'center', gap: 0.5 }}>
+                            <Typography variant="caption" sx={{ fontSize: '0.7rem', opacity: 0.7, flex: 1 }} noWrap>
+                              {email.body.replace(/\n/g, ' ')}
+                            </Typography>
+                            {email.has_attachments && <AttachFile sx={{ fontSize: 12, opacity: 0.7 }} />}
+                          </Box>
+                        </ListItemButton>
+                      ))
+                    )}
+                  </List>
                 </Box>
 
-                <Divider sx={{ mb: 2 }} />
-
-                <Typography variant="body2" sx={{ mb: 0.5 }}>
-                  <b>From:</b>&nbsp;{selectedEmail.sender}
-                </Typography>
-                <Typography variant="body2" sx={{ mb: 0.5 }}>
-                  <b>Date:</b>&nbsp;{selectedEmail.date}
-                </Typography>
-                <Typography
-                  variant="caption"
-                  sx={{ display: "block", mb: 3, color: "text.secondary", wordBreak: "break-all" }}
-                >
-                  <b>Path:</b>&nbsp;{selectedEmail.path}
-                </Typography>
-
-                <Divider sx={{ mb: 3 }} />
-
-                <Box sx={{ whiteSpace: "pre-wrap", color: "text.primary", fontSize: "0.82rem", lineHeight: 1.75 }}>
-                  Email body rendering to be implemented…
+                <Box sx={{ flex: 1, bgcolor: 'background.default', overflow: 'hidden' }}>
+                  {selectedEmail ? (
+                    renderEmailDetail(selectedEmail)
+                  ) : (
+                    <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', opacity: 0.3 }}>
+                      <Email sx={{ fontSize: 64, mb: 2 }} />
+                      <Typography variant="body1">No conversation selected</Typography>
+                    </Box>
+                  )}
                 </Box>
               </Box>
             )}
