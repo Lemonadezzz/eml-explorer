@@ -195,7 +195,8 @@ fn search_emails(app: tauri::AppHandle, query: String, path_filter: Option<Strin
         sql.push_str(" ORDER BY rank");
     }
     
-    sql.push_str(" LIMIT 100");
+    // user requested all emails to be loaded without arbitrary limits
+    // sql.push_str(" LIMIT 100"); 
 
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
